@@ -26,8 +26,8 @@
 #include "blas_test.hpp"
 
 template <typename T>
-using gemm_arguments_t =
-    std::tuple<int, int, int, int, int, char, char, T, T, int, int, int>;
+using gemm_arguments_t = std::tuple<int, int, int, int, int, char, char, T, T,
+                                    int, int, int, gemm_batch_type_t>;
 
 template <typename scalar_t>
 inline void verify_gemm(const gemm_arguments_t<scalar_t> arguments) {
@@ -43,8 +43,9 @@ inline void verify_gemm(const gemm_arguments_t<scalar_t> arguments) {
   int lda_mul;
   int ldb_mul;
   int ldc_mul;
+  gemm_batch_type_t batch_type;
   std::tie(offset, batch, m, n, k, transa, transb, alpha, beta, lda_mul,
-           ldb_mul, ldc_mul) = arguments;
+           ldb_mul, ldc_mul, batch_type) = arguments;
 
   const char ta_str[2] = {transa, '\0'};
   const char tb_str[2] = {transb, '\0'};
@@ -97,7 +98,8 @@ inline void verify_gemm(const gemm_arguments_t<scalar_t> arguments) {
           m_b_gpu + offset, ldb, beta, m_c_gpu + offset, ldc);
   } else {
     _gemm_batched(ex, transa, transb, m, n, k, alpha, m_a_gpu + offset, lda,
-                  m_b_gpu + offset, ldb, beta, m_c_gpu + offset, ldc, batch);
+                  m_b_gpu + offset, ldb, beta, m_c_gpu + offset, ldc, batch,
+                  batch_type);
   }
 
   auto event =
@@ -130,4 +132,3 @@ inline void verify_gemm(const gemm_arguments_t<scalar_t> arguments) {
 #define GENERATE_GEMM_TEST(TESTSUITE, COMBINATION) \
   GENERATE_GEMM_FLOAT(TESTSUITE, COMBINATION);     \
   GENERATE_GEMM_DOUBLE(TESTSUITE, COMBINATION)
-

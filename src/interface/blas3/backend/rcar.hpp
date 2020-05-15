@@ -37,7 +37,23 @@ typename Executor::policy_t::event_t _gemm(Executor& ex, index_t _M, index_t _N,
                                            container_t0 a_, index_t _lda,
                                            container_t1 b_, index_t _ldb,
                                            element_t _beta, container_t2 _C,
-                                           index_t _ldc, index_t batch_size) {
+                                           index_t _ldc, index_t batch_size,
+                                           gemm_batch_type_t batch_type) {
+  if (batch_type == gemm_batch_type_t::interleaved) {
+    return blas::Gemm_Launcher<
+        64, false, false, false, 64, Tile<2, 2, 2, 2, 1, 1, 8, 8>, _t_a, _t_b,
+        static_cast<int>(gemm_memory_t::no_local),
+        static_cast<int>(gemm_algorithm_t::standard),
+        static_cast<int>(gemm_vectorization_t::full), is_beta_zero, 1,
+        static_cast<int>(
+            gemm_batch_type_t::interleaved)>::template _select_gemm(ex, _M, _N,
+                                                                    _K, _alpha,
+                                                                    _a, _lda,
+                                                                    _b, _ldb,
+                                                                    _beta, _c,
+                                                                    _ldc,
+                                                                    batch_size);
+  }
   if (_M < 512 && _N < 512) {
     return blas::Gemm_Launcher<
         32, false, false, false, 128, Tile<4, 8, 8, 4>, _t_a, _t_b,
