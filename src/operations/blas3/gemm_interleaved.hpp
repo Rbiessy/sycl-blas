@@ -29,7 +29,7 @@
 
 namespace blas {
 
-namespace detail {
+namespace internal {
 
 template <class T, int Dim>
 struct packet {
@@ -44,7 +44,7 @@ struct packet<T, 1> {
 using address_t = cl::sycl::access::address_space;
 
 /*!
- * @brief Load a packet using @ref packet_helper.
+ * @brief Load a packet of size 1.
  */
 template <address_t Address = address_t::global_space, class T, class PtrT>
 SYCL_BLAS_INLINE void load(T &packet, PtrT ptr) {
@@ -52,7 +52,7 @@ SYCL_BLAS_INLINE void load(T &packet, PtrT ptr) {
 }
 
 /*!
- * @brief Store a packet using @ref packet_helper.
+ * @brief Store a packet of size 1.
  */
 template <address_t Address = address_t::global_space, class T, class PtrT>
 SYCL_BLAS_INLINE void store(T packet, PtrT ptr) {
@@ -60,7 +60,7 @@ SYCL_BLAS_INLINE void store(T packet, PtrT ptr) {
 }
 
 /*!
- * @brief Load a packet using @ref packet_helper.
+ * @brief Load a packet of size Dim.
  */
 template <address_t Address = address_t::global_space, class T, int Dim,
           class PtrT>
@@ -69,7 +69,7 @@ SYCL_BLAS_INLINE void load(cl::sycl::vec<T, Dim> &packet, PtrT ptr) {
 }
 
 /*!
- * @brief Store a packet using @ref packet_helper.
+ * @brief Store a packet of size Dim.
  */
 template <address_t Address = address_t::global_space, class T, int Dim,
           class PtrT>
@@ -77,7 +77,7 @@ SYCL_BLAS_INLINE void store(const cl::sycl::vec<T, Dim> &packet, PtrT ptr) {
   packet.template store<Address>(0, ptr);
 }
 
-}  // namespace detail
+}  // namespace internal
 
 /*!
  * @brief This partial specialization of the Gemm class add supports for
@@ -138,7 +138,7 @@ class Gemm<input_t, output_t, /* DoubleBuffer = */ false, /* NbcA = */ false,
   static constexpr bool trans_b = TransB;
   /*! @brief The packet type depends on the size of item_batchs as the kernel
    * is vectorizing over the batch dimension */
-  using packet_type = typename detail::packet<value_t, item_batchs>::type;
+  using packet_type = typename internal::packet<value_t, item_batchs>::type;
 
   static_assert(wg_cols * item_cols == item_rows * wg_rows,
                 "Work group size should be a multiple "
@@ -152,7 +152,7 @@ class Gemm<input_t, output_t, /* DoubleBuffer = */ false, /* NbcA = */ false,
   const element_t beta_;
   const index_t m_;
   const index_t n_;
-  const index_t k_;
+  index_t k_;
   const index_t lda_;
   const index_t ldb_;
   const index_t ldc_;
@@ -163,7 +163,7 @@ class Gemm<input_t, output_t, /* DoubleBuffer = */ false, /* NbcA = */ false,
         b_(B),
         c_(C),
         alpha_(alpha),
-        beta_(beta / alpha),  // TODO: do not divide here?
+        beta_(beta / alpha),
         m_(A.get_size_row()),
         n_(B.get_size_col()),
         k_(A.get_size_col()),
@@ -210,7 +210,7 @@ class Gemm<input_t, output_t, /* DoubleBuffer = */ false, /* NbcA = */ false,
       index_t compute_units) const noexcept {
     const cl::sycl::range<1> nwg(get_workgroup_cluster() *
                                  get_num_workgroup_cluster(compute_units));
-    const cl::sycl::range<1> wgs(wg_rows * wg_cols);
+    const cl::sycl::range<1> wgs(wg_rows * wg_cols * wg_batchs);
 
     return cl::sycl::nd_range<1>(nwg * wgs, wgs);
   }
@@ -222,21 +222,11 @@ class Gemm<input_t, output_t, /* DoubleBuffer = */ false, /* NbcA = */ false,
   }
 
   SYCL_BLAS_INLINE void eval(cl::sycl::nd_item<1> id) noexcept {
-    // The batch index that each workgroup should start working with
-    const index_t wg_batch_id = id.get_group(0) / get_workgroup_cluster();
-    // This will disable all workgroups that dont have any batch to work on
-    if (wg_batch_id >= batch_size_) {
-      return;
-    }
-
-    const index_t batch_stride =
-        id.get_group_range(0) / get_workgroup_cluster();
-
     const index_t a_size = trans_a ? m_ * lda_ : k_ * lda_;
     const index_t b_size = trans_b ? ldb_ * k_ : n_ * ldb_;
     const index_t c_size = ldc_ * n_;
 
-    auto A = a_.get_pointer();  //  + (wg_batch_id * a_size)?
+    auto A = a_.get_pointer();
     auto B = b_.get_pointer();
     auto C = c_.get_pointer();
 
@@ -246,7 +236,7 @@ class Gemm<input_t, output_t, /* DoubleBuffer = */ false, /* NbcA = */ false,
 
     /* linear work group id The number of work-group required to executed each
      * batch efficiently*/
-    const index_t wg_id = id.get_group(0) % get_workgroup_cluster();
+    const index_t wg_id = id.get_group(0);
     /* linear work item id */
     const index_t item_id = id.get_local_id(0);
 
@@ -272,25 +262,27 @@ class Gemm<input_t, output_t, /* DoubleBuffer = */ false, /* NbcA = */ false,
     const index_t local_item_id_row = (item_id / wg_batchs) % wg_rows;
     const index_t local_item_id_col = (item_id / wg_batchs) / wg_rows;
 
+    const index_t mb_start = (local_item_id_batch + wg_batch) * item_batchs;
+    const index_t m_start = local_item_id_row + wg_row;
+    const index_t n_start = local_item_id_col + wg_col;
+
     /* Exiting from any threads outside of the m_, n_, batch boundary */
     const bool out_of_range =
-        (((local_item_id_batch + wg_batch) * item_batchs >= batch_size_) ||
-         (local_item_id_row + wg_row >= m_) ||
-         (local_item_id_col + wg_col >= n_));
+        (mb_start >= batch_size_) ||
+         (m_start >= m_) ||
+         (n_start >= n_);
     if (out_of_range) {
       return;
     }
 
-    const index_t mb_start = (local_item_id_batch + wg_batch) * item_batchs;
-    const index_t m_start = local_item_id_row + wg_row;
-    const index_t n_start = local_item_id_col + wg_col;
-    const index_t single_a_stride = (trans_a ? lda_ : 1);
-    const index_t single_b_stride = (trans_b ? 1 : ldb_);
+    const index_t single_a_stride = trans_a ? lda_ : 1;
+    const index_t single_b_stride = trans_b ? 1 : ldb_;
 
+    // K start is always zero
     A += (m_start * single_a_stride * batch_size_) +
-         mb_start;  // K start is always zero
+         mb_start;
     B += (n_start * single_b_stride * batch_size_) +
-         mb_start;  // K start is always zero
+         mb_start;
     C += mb_start + (m_start * batch_size_) + (n_start * ldc_ * batch_size_);
 
     // boundary check
@@ -331,27 +323,27 @@ class Gemm<input_t, output_t, /* DoubleBuffer = */ false, /* NbcA = */ false,
     packet_type reg_a[item_rows];
     packet_type reg_b[item_cols];
     packet_type reg_res[item_rows * item_cols];
-    index_t k = k_;
+    scaling_c<need_check_boundary>(boundary_check, m_start, n_start, mb_start,
+                                    reg_res, C);
+    index_t stride_k_a = (trans_a ? 1 : lda_) * batch_size_;
+    index_t stride_k_b = (trans_b ? ldb_ : 1) * batch_size_;
+    index_t stride_load_a = (trans_a ? k_ : 1) * wg_rows * item_rows * batch_size_;
+    index_t stride_load_b = (trans_b ? 1 : k_) * item_cols * batch_size_; // *wg_cols?
     do {
-      scaling_c<need_check_boundary>(boundary_check, m_start, n_start, mb_start,
-                                     reg_res, C);
       load<item_rows, need_check_boundary>(
           boundary_check, m_start, mb_start, m_, reg_a, A,
-          batch_size_ * wg_rows * single_a_stride);
+          stride_load_a);
 #ifdef ARM_GPU
       id.barrier(cl::sycl::access::fence_space::local_space);
 #endif
       load<item_cols, need_check_boundary>(
           boundary_check, n_start, mb_start, n_, reg_b, B,
-          batch_size_ * wg_cols * single_b_stride);
+          stride_load_b);
       compute_block(reg_a, reg_b, reg_res);
-
-      index_t next_k_b = (trans_b ? ldb_ : 1);
-      index_t next_k_a = (trans_a ? 1 : lda_);
-      B += batch_size_ * next_k_b;
-      A += batch_size_ * next_k_a;
-      --k;
-    } while (k > 0);
+      A += stride_k_a;
+      B += stride_k_b;
+      --k_;
+    } while (k_ > 0);
     store<need_check_boundary>(boundary_check, m_start, n_start, mb_start,
                                reg_res, C);
   }
@@ -363,28 +355,29 @@ class Gemm<input_t, output_t, /* DoubleBuffer = */ false, /* NbcA = */ false,
                              packet_type *reg_res, ptr_t input,
                              index_t stride) {
     bool b_range = do_check<need_check_boundary>(
-        boundary_check(mb_start + item_batchs, batch_size_));
+        boundary_check(mb_start + item_batchs - 1, batch_size_));
 #pragma unroll
     for (int i = 0; i < item_size; ++i) {
       auto in_range = do_check<need_check_boundary>(boundary_check(
-          i + index_start, dim_size));  // TODO: changed from pseudo code
+          i + index_start, dim_size));
       if (in_range) {
         if (b_range) {
-          detail::load(reg_res[i], input);
+          internal::load(*reg_res, input);
         } else {
 #pragma unroll
           for (int p = 0; p < item_batchs; ++p) {
             auto is_in = do_check<need_check_boundary>(
                 boundary_check(mb_start + p, batch_size_));
             reinterpret_cast<value_t *>(reg_res)[p] =
-                is_in ? input[i]
-                      : value_t(0);  // TODO: changed from pseudo code
+                is_in ? input[p]
+                      : value_t(0);
           }
         }
       } else {
-        reg_res[i] = packet_type{0};
+        *reg_res = packet_type{0};
       }
       input += stride;
+      ++reg_res;
     }
   }
 
@@ -393,7 +386,7 @@ class Gemm<input_t, output_t, /* DoubleBuffer = */ false, /* NbcA = */ false,
                               index_t n_start, index_t mb_start,
                               packet_type *reg_res, ptr_t C) {
     bool b_range = do_check<need_check_boundary>(
-        boundary_check(mb_start + item_batchs, batch_size_));
+        boundary_check(mb_start + item_batchs - 1, batch_size_));
 #pragma unroll
     for (int i = 0; i < item_cols; ++i) {
 #pragma unroll
@@ -401,11 +394,11 @@ class Gemm<input_t, output_t, /* DoubleBuffer = */ false, /* NbcA = */ false,
         bool in_range = do_check<need_check_boundary>(
             boundary_check(m_start + j, m_) && boundary_check(n_start + i, n_));
         if (in_range) {
-          auto output = C + ((j * wg_rows) * batch_size_) +
-                        ((i * wg_cols) * ldc_ * batch_size_);
+          auto output = C + ((j * wg_rows * item_rows) * batch_size_) +
+                        ((i * item_cols) * ldc_ * batch_size_); // *wg_cols?
           *reg_res *= alpha_;
           if (b_range) {
-            detail::store(*reg_res, output);
+            internal::store(*reg_res, output);
           } else {
             for (int p = 0; p < item_batchs; ++p) {
               auto is_in = do_check<need_check_boundary>(
@@ -427,7 +420,7 @@ class Gemm<input_t, output_t, /* DoubleBuffer = */ false, /* NbcA = */ false,
       check_t boundary_check, index_t m_start, index_t n_start,
       index_t mb_start, packet_type *reg_res, ptr_t C) {
     bool b_range = do_check<need_check_boundary>(
-        boundary_check(mb_start + item_batchs, batch_size_));
+        boundary_check(mb_start + item_batchs - 1, batch_size_));
 #pragma unroll
     for (int i = 0; i < item_cols; ++i) {
 #pragma unroll
@@ -435,12 +428,11 @@ class Gemm<input_t, output_t, /* DoubleBuffer = */ false, /* NbcA = */ false,
         bool in_range = do_check<need_check_boundary>(
             boundary_check(m_start + j, m_) && boundary_check(n_start + i, n_));
         if (in_range) {
-          auto output = C + ((j * wg_rows) * batch_size_) +
-                        ((i * wg_cols) * ldc_ * batch_size_);
-          //*reg_res = (*reg_res) * alpha_; // TODO: revert?
+          auto output = C + ((j * wg_rows * item_rows) * batch_size_) +
+                        ((i * item_cols) * ldc_ * batch_size_); // *wg_cols?
           if (b_range) {
-            detail::load(*reg_res,
-                         output);  // TODO changed from reg_res[i] to *reg_res
+            internal::load(*reg_res,
+                         output);
             *reg_res *= beta_;
           } else {
             for (int p = 0; p < item_batchs; ++p) {

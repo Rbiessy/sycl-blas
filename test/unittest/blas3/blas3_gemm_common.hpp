@@ -23,11 +23,55 @@
  *
  **************************************************************************/
 
+#include <utility>
+
 #include "blas_test.hpp"
 
 template <typename T>
 using gemm_arguments_t = std::tuple<int, int, int, int, int, char, char, T, T,
                                     int, int, int, gemm_batch_type_t>;
+
+// Convert batch_type=strided to interleaved on the host
+template <typename scalar_t>
+inline std::vector<scalar_t> strided_to_interleaved(
+    const std::vector<scalar_t>& input, int offset, int rows, int cols,
+    int batchs, int ld_rows, int ld_cols, bool trans) {
+  if (trans) {
+    std::swap(rows, cols);
+    std::swap(ld_rows, ld_cols);
+  }
+  std::vector<scalar_t> output(input.size());
+  for (int c = 0; c < cols; ++c) {
+    for (int r = 0; r < rows; ++r) {
+      for (int b = 0; b < batchs; ++b) {
+        output[c * ld_rows * batchs + r * batchs + b + offset] =
+            input[b * ld_cols * ld_rows + c * ld_rows + r + offset];
+      }
+    }
+  }
+  return output;
+}
+
+// Convert batch_type=interleaved to strided on the host
+template <typename scalar_t>
+inline std::vector<scalar_t> interleaved_to_strided(
+    const std::vector<scalar_t>& input, int offset, int rows, int cols,
+    int batchs, int ld_rows, int ld_cols, bool trans) {
+  if (trans) {
+    std::swap(rows, cols);
+    std::swap(ld_rows, ld_cols);
+  }
+  std::vector<scalar_t> output(input.size());
+  for (int b = 0; b < batchs; ++b) {
+    for (int c = 0; c < cols; ++c) {
+      for (int r = 0; r < rows; ++r) {
+        output[b * ld_cols * ld_rows + c * ld_rows + r + offset] =
+            input[c * ld_rows * batchs + r * batchs + b + offset];
+      }
+    }
+  }
+  return output;
+}
 
 template <typename scalar_t>
 inline void verify_gemm(const gemm_arguments_t<scalar_t> arguments) {
@@ -84,6 +128,15 @@ inline void verify_gemm(const gemm_arguments_t<scalar_t> arguments) {
                          c_m_cpu.data() + i * size_c + offset, ldc);
   }
 
+  if (batch > 1 && batch_type == gemm_batch_type_t::interleaved) {
+    a_m =
+        strided_to_interleaved(a_m, offset, m, k, batch, lda, k, transa == 't');
+    b_m =
+        strided_to_interleaved(b_m, offset, k, n, batch, ldb, n, transb == 't');
+    c_m_gpu =
+        strided_to_interleaved(c_m_gpu, offset, m, n, batch, ldc, n, false);
+  }
+
   auto m_a_gpu = blas::make_sycl_iterator_buffer<scalar_t>(buffer_size_a);
   auto m_b_gpu = blas::make_sycl_iterator_buffer<scalar_t>(buffer_size_b);
   auto m_c_gpu = blas::make_sycl_iterator_buffer<scalar_t>(buffer_size_c);
@@ -105,6 +158,11 @@ inline void verify_gemm(const gemm_arguments_t<scalar_t> arguments) {
   auto event =
       policy_handler.copy_to_host(m_c_gpu, c_m_gpu.data(), buffer_size_c);
   policy_handler.wait(event);
+
+  if (batch > 1 && batch_type == gemm_batch_type_t::interleaved) {
+    c_m_gpu =
+        interleaved_to_strided(c_m_gpu, offset, m, n, batch, ldc, n, false);
+  }
 
   ASSERT_TRUE(utils::compare_vectors(c_m_gpu, c_m_cpu));
   ex.get_policy_handler().wait();

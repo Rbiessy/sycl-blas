@@ -61,7 +61,7 @@ const auto BetaNonZeroLDMultiplied = ::testing::Combine(
 );
 GENERATE_GEMM_TEST(BatchGemm, BetaNonZeroLDMultiplied);
 
-const auto BetaZeroInterleaved = ::testing::Combine(
+const auto BetaZeroLDMatchInterleaved = ::testing::Combine(
     ::testing::Values(0),                              // offset
     ::testing::Values(16),                             // batch
     ::testing::Values(128),                            // m
@@ -76,4 +76,4 @@ const auto BetaZeroInterleaved = ::testing::Combine(
     ::testing::Values(1),                              // ldc_mul
     ::testing::Values(gemm_batch_type_t::interleaved)  // batch_type
 );
-GENERATE_GEMM_TEST(BatchGemm, BetaZeroInterleaved);
+GENERATE_GEMM_TEST(BatchGemm, BetaZeroLDMatchInterleaved);
